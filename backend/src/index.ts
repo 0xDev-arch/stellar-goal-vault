@@ -11,7 +11,9 @@ import path from 'path';
 import { config, walletIntegrationReady } from './config';
 import { apiKeyAuthMiddleware } from './middleware/apiKeyAuth';
 import { cacheMiddleware } from './middleware/cacheMiddleware';
+import { idempotencyMiddleware } from './middleware/idempotencyMiddleware';
 import { requestIdMiddleware } from './middleware/requestId';
+import { requestLoggingMiddleware } from './middleware/requestLogging';
 import { validateBody } from './middleware/validateBody';
 import type { RequestWithId } from './middleware/types';
 import { initRedisCache } from './services/cache';
@@ -49,7 +51,7 @@ import {
 } from './services/campaignStore';
 import { checkDbHealth } from './services/db';
 import { getCampaignTimeline, listCampaignHistory } from './services/eventHistory';
-import { startEventIndexer } from './services/eventIndexer';
+import { startEventIndexer, getIndexerStatus } from './services/eventIndexer';
 import {
   listNotifications,
   getUnreadCount,
@@ -168,7 +170,15 @@ if (process.env.NODE_ENV === 'production') {
   app.use(cacheMiddleware(300));
 }
 
-const rateLimitBuckets = new Map<string, { count: number; resetAt: number }>();
+import { LRUCache } from 'lru-cache';
+
+const rateLimitBuckets = new LRUCache<string, { count: number; resetAt: number }>({
+  max: 5000,
+});
+
+export function clearRateLimitCache() {
+  rateLimitBuckets.clear();
+}
 
 export function applyRateLimit(limitOverride?: number) {
   return (req: Request, res: Response, next: express.NextFunction) => {
@@ -180,6 +190,11 @@ export function applyRateLimit(limitOverride?: number) {
 
     // Skip rate limiting when client IP is unavailable (common in test environments)
     if (!req.ip) {
+      return next();
+    }
+
+    // Skip rate limiting for local development to avoid blocking normal workflow
+    if (process.env.NODE_ENV === 'development' || (process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'test')) {
       return next();
     }
 
@@ -217,6 +232,7 @@ export function applyRateLimit(limitOverride?: number) {
 app.use(applyRateLimit());
 
 app.use(requestIdMiddleware);
+app.use(requestLoggingMiddleware);
 
 function sendValidationError(issues: z.ZodIssue[]): never {
   throw new AppError(
@@ -339,7 +355,10 @@ export function filterCampaignList(
 
 app.get('/api/health', (_req: Request, res: Response) => {
   const database = checkDbHealth();
-  const healthy = database.reachable;
+  const indexer = getIndexerStatus();
+  
+  // Healthy if DB is reachable and indexer isn't stuck failing
+  const healthy = database.reachable && indexer.isHealthy;
 
   res.status(healthy ? 200 : 503).json({
     service: 'stellar-goal-vault-backend',
@@ -347,6 +366,7 @@ app.get('/api/health', (_req: Request, res: Response) => {
     timestamp: new Date().toISOString(),
     uptimeSeconds: Number(process.uptime().toFixed(3)),
     database,
+    indexer,
   });
 });
 app.get('/api/contributors/:address/pledges', async (req: Request, res: Response) => {
@@ -386,7 +406,8 @@ app.get('/api/health/deep', applyRateLimit(1000), async (_req: Request, res: Res
       sorobanHealthy = false;
     }
 
-    const allHealthy = database.reachable && hasContractId && sorobanHealthy;
+    const indexer = getIndexerStatus();
+    const allHealthy = database.reachable && hasContractId && sorobanHealthy && indexer.isHealthy;
 
     res.status(allHealthy ? 200 : 503).json({
       overall: allHealthy ? 'up' : 'down',
@@ -406,6 +427,10 @@ app.get('/api/health/deep', applyRateLimit(1000), async (_req: Request, res: Res
         contract: {
           status: hasContractId ? 'up' : 'down',
           details: hasContractId ? 'CONTRACT_ID configured' : 'CONTRACT_ID not set',
+        },
+        indexer: {
+          status: indexer.isHealthy ? 'up' : 'down',
+          details: indexer,
         },
       },
     });
@@ -517,11 +542,12 @@ app.get('/api/campaigns/trending', (req: Request, res: Response) => {
   res.send(responseBody);
 });
 
-app.get('/api/campaigns/:id', (req: Request, res: Response) => {
-  const parsedId = parseCampaignId(req.params.id);
-  if (!parsedId.ok) {
-    sendValidationError(parsedId.issues);
-  }
+app.get('/api/campaigns/:id', async (req: Request, res: Response, next: express.NextFunction) => {
+  try {
+    const parsedId = parseCampaignId(req.params.id);
+    if (!parsedId.ok) {
+      sendValidationError(parsedId.issues);
+    }
 
     const cacheKey = `campaigns:detail:${parsedId.value}`;
     const cached = await getCampaignCacheEntry(cacheKey);
